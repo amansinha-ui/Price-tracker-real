@@ -1,0 +1,606 @@
+import os
+import re
+import ssl
+import smtplib
+import requests
+
+from bs4 import BeautifulSoup
+from email.message import EmailMessage
+from urllib.parse import quote
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+EMAIL_TO = "amankumarsinha2008@gmail.com"
+
+MIN_DISCOUNT = 40
+
+MAX_PRODUCTS_PER_SITE = 20
+
+TIMEOUT = 20
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-IN,en;q=0.9",
+}
+
+
+# =========================================================
+# SEARCH PAGES
+# =========================================================
+
+URLS = {
+    "Amazon - Shoes":
+        "https://www.amazon.in/s?k=shoes",
+
+    "Amazon - Skin Care":
+        "https://www.amazon.in/s?k=skin+care",
+
+    "Flipkart - Shoes":
+        "https://www.flipkart.com/q/shoes",
+
+    "Flipkart - Skin Care":
+        "https://www.flipkart.com/search?q=skin%20care",
+
+    "Myntra - Shoes":
+        "https://www.myntra.com/shoes",
+
+    "Myntra - Skin Care":
+        "https://www.myntra.com/skincare",
+}
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def clean_text(text):
+    if not text:
+        return ""
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_number(text):
+    if not text:
+        return None
+
+    text = text.replace(",", "")
+
+    match = re.search(r"(\d+(?:\.\d+)?)", text)
+
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+
+    return None
+
+
+def extract_discount(text):
+    if not text:
+        return None
+
+    patterns = [
+        r"(\d+(?:\.\d+)?)\s*%\s*(?:off|OFF)",
+        r"(\d+(?:\.\d+)?)\s*%\s*discount",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.I)
+
+        if match:
+            return float(match.group(1))
+
+    return None
+
+
+def make_absolute_url(url, base_url):
+    if not url:
+        return ""
+
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+
+    if url.startswith("//"):
+        return "https:" + url
+
+    if url.startswith("/"):
+        from urllib.parse import urljoin
+        return urljoin(base_url, url)
+
+    return url
+
+
+# =========================================================
+# GENERIC PRODUCT EXTRACTION
+# =========================================================
+
+def parse_products(html, source_name, base_url):
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    products = []
+
+    # -----------------------------------------------------
+    # Try common product containers
+    # -----------------------------------------------------
+
+    selectors = [
+        "[data-product-id]",
+        "[data-productid]",
+        ".product-base",
+        ".product",
+        ".product-card",
+        ".product-base",
+        "article",
+        "li",
+    ]
+
+    containers = []
+
+    for selector in selectors:
+        found = soup.select(selector)
+
+        if found:
+            containers.extend(found)
+
+        if len(containers) >= MAX_PRODUCTS_PER_SITE * 3:
+            break
+
+    # Remove duplicate containers
+    unique_containers = []
+
+    seen_ids = set()
+
+    for container in containers:
+
+        container_id = id(container)
+
+        if container_id not in seen_ids:
+            seen_ids.add(container_id)
+            unique_containers.append(container)
+
+    # -----------------------------------------------------
+    # Parse each container
+    # -----------------------------------------------------
+
+    for container in unique_containers:
+
+        text = clean_text(container.get_text(" ", strip=True))
+
+        if len(text) < 10:
+            continue
+
+        discount = extract_discount(text)
+
+        if discount is None:
+            continue
+
+        if discount < MIN_DISCOUNT:
+            continue
+
+        # ---------------------------------------------
+        # Find product name
+        # ---------------------------------------------
+
+        name = None
+
+        for selector in [
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            ".product-title",
+            ".product-name",
+            "[class*='title']",
+            "[class*='name']",
+        ]:
+            element = container.select_one(selector)
+
+            if element:
+                name = clean_text(element.get_text(" ", strip=True))
+
+                if len(name) >= 3:
+                    break
+
+        # ---------------------------------------------
+        # Fallback name
+        # ---------------------------------------------
+
+        if not name:
+            name = text[:150]
+
+        # ---------------------------------------------
+        # Find prices
+        # ---------------------------------------------
+
+        prices = []
+
+        for element in container.find_all(
+            ["span", "div", "p", "del"]
+        ):
+
+            element_text = clean_text(
+                element.get_text(" ", strip=True)
+            )
+
+            if "₹" not in element_text:
+                continue
+
+            number = extract_number(element_text)
+
+            if number:
+                prices.append(number)
+
+        # Need at least current + old price
+        if len(prices) < 2:
+            continue
+
+        current_price = min(prices)
+
+        old_price = max(prices)
+
+        # ---------------------------------------------
+        # Sanity check
+        # ---------------------------------------------
+
+        if old_price <= current_price:
+            continue
+
+        calculated_discount = (
+            (old_price - current_price)
+            / old_price
+        ) * 100
+
+        # Use calculated value when possible
+        discount = round(calculated_discount, 1)
+
+        if discount < MIN_DISCOUNT:
+            continue
+
+        # ---------------------------------------------
+        # Product link
+        # ---------------------------------------------
+
+        link = ""
+
+        anchor = container.find("a", href=True)
+
+        if anchor:
+            link = make_absolute_url(
+                anchor.get("href"),
+                base_url
+            )
+
+        # ---------------------------------------------
+        # Save
+        # ---------------------------------------------
+
+        product = {
+            "source": source_name,
+            "name": name,
+            "price": current_price,
+            "old_price": old_price,
+            "discount": discount,
+            "url": link,
+        }
+
+        products.append(product)
+
+        if len(products) >= MAX_PRODUCTS_PER_SITE:
+            break
+
+    return products
+
+
+# =========================================================
+# FETCH WEBSITE
+# =========================================================
+
+def fetch_products(source_name, url):
+
+    print(f"\nChecking: {source_name}")
+    print(url)
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=HEADERS,
+            timeout=TIMEOUT,
+        )
+
+        print(
+            f"HTTP status: {response.status_code}"
+        )
+
+        if response.status_code != 200:
+            print(
+                f"Failed: {source_name}"
+            )
+            return []
+
+        products = parse_products(
+            response.text,
+            source_name,
+            url,
+        )
+
+        print(
+            f"Found {len(products)} qualifying products"
+        )
+
+        return products
+
+    except requests.RequestException as error:
+
+        print(
+            f"Request error on {source_name}: {error}"
+        )
+
+        return []
+
+    except Exception as error:
+
+        print(
+            f"Unexpected error on {source_name}: {error}"
+        )
+
+        return []
+
+
+# =========================================================
+# EMAIL
+# =========================================================
+
+def send_email(products):
+
+    if not products:
+        print(
+            "\nNo products with 40%+ discount found."
+        )
+        return
+
+    sender_email = os.getenv("TRACKER_EMAIL")
+
+    sender_password = os.getenv(
+        "TRACKER_EMAIL_PASSWORD"
+    )
+
+    if not sender_email:
+        print(
+            "ERROR: TRACKER_EMAIL environment variable "
+            "is missing."
+        )
+        return
+
+    if not sender_password:
+        print(
+            "ERROR: TRACKER_EMAIL_PASSWORD environment "
+            "variable is missing."
+        )
+        return
+
+    # -----------------------------------------------------
+    # Create email
+    # -----------------------------------------------------
+
+    message = EmailMessage()
+
+    message["From"] = sender_email
+
+    message["To"] = EMAIL_TO
+
+    message["Subject"] = (
+        f"🛍️ Price Tracker: "
+        f"{len(products)} deals with 40%+ discount"
+    )
+
+    body = []
+
+    body.append(
+        "PRICE TRACKER REPORT"
+    )
+
+    body.append(
+        "===================="
+    )
+
+    body.append("")
+
+    body.append(
+        f"Products found: {len(products)}"
+    )
+
+    body.append(
+        f"Minimum discount: {MIN_DISCOUNT}%"
+    )
+
+    body.append("")
+
+    for index, product in enumerate(
+        products,
+        start=1
+    ):
+
+        body.append(
+            f"{index}. {product['name']}"
+        )
+
+        body.append(
+            f"   Website: {product['source']}"
+        )
+
+        body.append(
+            f"   Price: ₹{product['price']:,.0f}"
+        )
+
+        body.append(
+            f"   MRP/Old Price: ₹"
+            f"{product['old_price']:,.0f}"
+        )
+
+        body.append(
+            f"   Discount: "
+            f"{product['discount']:.1f}%"
+        )
+
+        if product["url"]:
+            body.append(
+                f"   Link: {product['url']}"
+            )
+
+        body.append("")
+
+    message.set_content(
+        "\n".join(body)
+    )
+
+    # -----------------------------------------------------
+    # Gmail SMTP
+    # -----------------------------------------------------
+
+    context = ssl.create_default_context()
+
+    try:
+
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com",
+            465,
+            context=context,
+        ) as server:
+
+            server.login(
+                sender_email,
+                sender_password,
+            )
+
+            server.send_message(message)
+
+        print(
+            "\nEmail sent successfully!"
+        )
+
+    except Exception as error:
+
+        print(
+            f"\nEmail sending failed: {error}"
+        )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    print(
+        "===================================="
+    )
+
+    print(
+        "      PRICE TRACKER STARTED"
+    )
+
+    print(
+        "===================================="
+    )
+
+    print(
+        f"Minimum discount: {MIN_DISCOUNT}%"
+    )
+
+    print(
+        f"Email destination: {EMAIL_TO}"
+    )
+
+    all_products = []
+
+    # -----------------------------------------------------
+    # Check all websites
+    # -----------------------------------------------------
+
+    for source_name, url in URLS.items():
+
+        products = fetch_products(
+            source_name,
+            url,
+        )
+
+        all_products.extend(products)
+
+    # -----------------------------------------------------
+    # Remove duplicates
+    # -----------------------------------------------------
+
+    unique_products = []
+
+    seen = set()
+
+    for product in all_products:
+
+        key = (
+            product["source"],
+            product["name"],
+            product["price"],
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        unique_products.append(product)
+
+    # -----------------------------------------------------
+    # Sort highest discount first
+    # -----------------------------------------------------
+
+    unique_products.sort(
+        key=lambda item: item["discount"],
+        reverse=True,
+    )
+
+    print(
+        "\n===================================="
+    )
+
+    print(
+        f"TOTAL DEALS: {len(unique_products)}"
+    )
+
+    print(
+        "===================================="
+    )
+
+    for product in unique_products:
+
+        print(
+            f"{product['discount']:.1f}% | "
+            f"₹{product['price']:,.0f} | "
+            f"{product['name'][:80]}"
+        )
+
+    # -----------------------------------------------------
+    # Send email
+    # -----------------------------------------------------
+
+    send_email(
+        unique_products
+    )
+
+    print(
+        "\nPRICE TRACKER FINISHED."
+    )
+
+
+if __name__ == "__main__":
+    main()
